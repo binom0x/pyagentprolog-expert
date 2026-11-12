@@ -1,0 +1,140 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyagentprolog-expert"
+dynamic = ["version"]
+description = "Expert system on knowledge graphs (PyAgentProlog + nl2prolog)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrey Vorfolomeev", email = "binom0x@proton.me" }]
+keywords = [
+    "prolog", "expert-system", "knowledge-graph",
+    "nlp", "nl2prolog", "pyagentprolog",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# --- обязательные: только то, без чего Expert не работает ---
+dependencies = [
+    "pyagentprolog>=1.0.1",
+]
+
+[project.optional-dependencies]
+# NL→query, NL→facts (ask / assert_nl)
+nl = [
+    "nl2prolog[ru]>=1.0.2",
+]
+# semantic unify (опционально поверх PyAgentProlog)
+semantic = [
+    "sentence-transformers>=2.2",
+]
+# Всё сразу (без kg-editor — он не нужен)
+all = [
+    "nl2prolog[ru]>=1.0.2",
+    "sentence-transformers>=2.2",
+]
+# Для разработки
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "build>=1.2",
+    "twine>=5.1",
+]
+
+[project.scripts]
+pa-expert = "pyagentprolog_expert.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/binom0x/pyagentprolog-expert"
+Documentation = "https://github.com/binom0x/pyagentprolog-expert#readme"
+Issues = "https://github.com/binom0x/pyagentprolog-expert/issues"
+Changelog = "https://github.com/binom0x/pyagentprolog-expert/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pyagentprolog_expert = [
+    "rules.pl.example",
+    "py.typed",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "pyagentprolog_expert._version.__version__" }
+
+# --- ruff ---
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",     # длина строки — не критично для проекта
+    "RUF001",   # кириллица в строках: «Н» vs «H», «с» vs «c» — норма
+    "RUF002",   # кириллица в docstring — норма
+    "RUF003",   # кириллица в комментариях — норма
+    "UP006",    # typing.Dict/List → dict/list: код в стиле typing.*
+    "UP035",    # typing.Dict/List deprecated: см. UP006
+    "UP045",    # Optional[X] → X | None: код в стиле typing.Optional
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+# --- mypy ---
+[tool.mypy]
+python_version = "3.10"
+packages = ["pyagentprolog_expert"]
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = false
+ignore_missing_imports = true
+
+# --- pytest ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: медленные тесты",
+    "nl: требуют nl2prolog",
+    "prolog: требуют pyagentprolog",
+    "kg_editor: требуют kg-editor (необязательно)",
+]
+filterwarnings = [
+    # pymorphy2 (транзитивно через nl2prolog) использует устаревший
+    # pkg_resources. Не наш код — подавляем, чтобы CI был чистый.
+    "ignore:pkg_resources is deprecated as an API:UserWarning",
+    "ignore:Deprecated call to `pkg_resources.declare_namespace:DeprecationWarning",
+    # torch/sentence-transformers могут сыпать предупреждениями
+    "ignore::DeprecationWarning:torch.*",
+    "ignore::FutureWarning:transformers.*",
+]
+
+[tool.coverage.run]
+source = ["pyagentprolog_expert"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

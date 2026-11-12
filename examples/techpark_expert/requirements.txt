@@ -1,0 +1,1 @@
+pyagentprolog-expert[nl]>=1.0.5
