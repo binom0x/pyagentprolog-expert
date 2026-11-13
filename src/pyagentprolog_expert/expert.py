@@ -1,7 +1,7 @@
 """Expert — экспертная система на графе знаний.
 
-PyAgentProlog (Agent) — движок вывода.
-nl2prolog (TextToProlog, DialogTurn) — NL→query и NL→facts (опция).
+PyAgentProlog (Agent) — движок вывода (опционально).
+nl2prolog (TextToProlog, DialogTurn) — NL→query и NL→facts (опционально).
 Встроенный KnowledgeGraph — источник фактов.
 
 Формат KB — граф знаний:
@@ -14,17 +14,29 @@ human_readable/2) хранятся в rules.pl и подгружаются в Ag
 запрос вместе с _CONVENIENCE_RULES. KnowledgeGraph их не видит.
 
 Схема vs данные:
-  * graph.pl   — ДАННЫЕ: конкретные сущности, их связи и свойства
-                 (в т.ч. attribute(Id, 'label', L), edge(S, F, 'alias_of'),
-                 node(S, [], solution) + рёбра solution).
-  * rules.pl   — СХЕМА: как связывать факты (located_in/2,
-                 human_readable/2, alias/2, solution/1/condition/1).
+  * graph.pl   — ДАННЫЕ: сущности, связи, свойства (label, alias_of,
+                 solution-узлы).
+  * rules.pl   — СХЕМА: как связывать факты.
 Expert не знает ни одной сущности домена в коде.
+
+Архитектура импортов:
+  * `prolog` (PyAgentProlog) — лениво, на первом query().
+    `import prolog` занимает 10-15 с (numba/numpy/interpreter).
+  * `nl2prolog` — лениво, на первом ask()/assert_nl().
+    `import nl2prolog` + TextToProlog() — ещё 5-15 с.
+  * `import pyagentprolog_expert` <0.2 с; `Expert()` <0.01 с.
+
+Использование:
+    e = Expert(graph=g, rules_file="rules.pl")   # <0.01 с
+    qr = e.query("edge(X, 'a', 'b').")            # +10-15 с при первом
+    ans = e.ask("Кто директор?")                  # +5-15 с при первом
+    e.warmup_nl()                                  # явная загрузка NLP
 """
 from __future__ import annotations
 
 import contextlib
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -37,37 +49,99 @@ from .rules_engine import (
 )
 from .session import NullSession, Session
 
-try:
-    from prolog.agent import Agent
-    _AGENT_OK = True
-except ImportError:
-    Agent = None
-    _AGENT_OK = False
 
-try:
-    from nl2prolog import DialogTurn, TextToProlog
-    _NL2PROLOG_OK = True
-except ImportError:
-    TextToProlog = None
-    DialogTurn = None
-    _NL2PROLOG_OK = False
+# =====================================================================
+# Lazy imports
+# =====================================================================
+_Agent: Any = None
+_AGENT_OK: Optional[bool] = None
+_AGENT_LOCK = threading.Lock()
+
+_TextToProlog: Any = None
+_DialogTurn: Any = None
+_NL2PROLOG_OK: Optional[bool] = None
+_NL2PROLOG_LOCK = threading.Lock()
 
 
+def _ensure_agent() -> bool:
+    """Lazy import `prolog.agent.Agent`. Возвращает True, если доступен."""
+    global _Agent, _AGENT_OK
+    if _AGENT_OK is not None:
+        return _AGENT_OK
+    with _AGENT_LOCK:
+        if _AGENT_OK is not None:
+            return _AGENT_OK
+        try:
+            from prolog.agent import Agent as _A
+            _Agent = _A
+            _AGENT_OK = True
+        except ImportError:
+            _Agent = None
+            _AGENT_OK = False
+        return _AGENT_OK
+
+
+def _ensure_nl2prolog() -> bool:
+    """Lazy import `nl2prolog`. Возвращает True, если доступен."""
+    global _TextToProlog, _DialogTurn, _NL2PROLOG_OK
+    if _NL2PROLOG_OK is not None:
+        return _NL2PROLOG_OK
+    with _NL2PROLOG_LOCK:
+        if _NL2PROLOG_OK is not None:
+            return _NL2PROLOG_OK
+        try:
+            from nl2prolog import DialogTurn, TextToProlog
+            _TextToProlog = TextToProlog
+            _DialogTurn = DialogTurn
+            _NL2PROLOG_OK = True
+        except ImportError:
+            _TextToProlog = None
+            _DialogTurn = None
+            _NL2PROLOG_OK = False
+        return _NL2PROLOG_OK
+
+
+# =====================================================================
+# Convenience rules — добавляются в Agent на каждый запрос
+# =====================================================================
 _CONVENIENCE_RULES = """
 % --- convenience rules (added by Expert) ---
 node(Id, Type) :- node(Id, _, Type).
 edge(S, T) :- edge(S, T, _).
+
+% condition_check/1 — true if the condition holds in the graph.
+% Domain-neutral; used by ask_interactive() for _missing_conditions().
+condition_check(triplet(P, S, O)) :- edge(S, O, P).
+condition_check(attr(N, A)) :- attribute(N, A, _).
+condition_check(fact(F)) :- node(F, _, _).
 """
 
 _SOLUTION_LIMIT = 1000
 
-
-# Валидный атом — совпадает с graph._VALID_ATOM и _RESERVED_ATOMS.
-# Используется в _normalize_query_atoms для снятия кавычек.
+# Валидный атом — совпадает с graph._VALID_ATOM.
 _VALID_ATOM_RE = re.compile(r"^[a-z][A-Za-z0-9_]*$")
 _RESERVED_ATOMS = {"is", "mod", "div", "rem", "xor", "not"}
 
+# Регексы для разбора triplet/attr/fact в _missing_conditions()
+# и _add_triplet_fallback(). Принимают аргументы как в кавычках, так
+# и без — `findall(C, condition(C), Cs)` возвращает уже развёрнутый
+# аргумент, часто без кавычек:
+#     triplet(director, смирнова_анна, технопарк_тюмень)
+_TRIPLET_RE = re.compile(
+    r"triplet\(\s*['\"]?([^,()'\"]+?)['\"]?\s*,\s*"
+    r"['\"]?([^,()'\"]+?)['\"]?\s*,\s*"
+    r"['\"]?([^,()'\"]+?)['\"]?\s*\)"
+)
+_ATTR_RE = re.compile(
+    r"attr\(\s*['\"]?([^,()'\"]+?)['\"]?\s*,\s*"
+    r"['\"]?([^,()'\"]+?)['\"]?\s*\)"
+)
+_FACT_RE = re.compile(r"fact\(\s*['\"]?([^,()'\"]+?)['\"]?\s*\)")
 
+
+# =====================================================================
+# Результаты
+# =====================================================================
 @dataclass
 class QueryResult:
     ok: bool
@@ -98,18 +172,22 @@ class ExpertAnswer:
     category: Optional[str] = None
 
 
-def _require(cond: bool, pkg: str, hint: str) -> None:
-    if not cond:
-        raise RuntimeError(f"{pkg} не установлен: {hint}")
+# =====================================================================
+# Дедупликация решений
+# =====================================================================
+def _dedup_solutions(
+    sols: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Убрать полные дубликаты биндингов.
 
-def _dedup_solutions(sols: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Убрать полные дубликаты (одинаковые биндинги)."""
+    located_in/2 может найти несколько путей к одному X
+    (например, «казань → татарстан → россия» и «казань → россия»),
+    если в graph.pl есть прямые рёбра. Дедуплицируем для вывода.
+    """
     seen: set[tuple] = set()
     out: List[Dict[str, Any]] = []
     for s in sols:
-        key = tuple(sorted(
-            (k, str(v)) for k, v in s.items()
-        ))
+        key = tuple(sorted((k, str(v)) for k, v in s.items()))
         if key in seen:
             continue
         seen.add(key)
@@ -117,19 +195,25 @@ def _dedup_solutions(sols: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+# =====================================================================
+# Expert
+# =====================================================================
 class Expert:
     def __init__(
         self,
         graph: Optional[KnowledgeGraph] = None,
         rules_file: Optional[str] = None,
         t2p: Optional[Any] = None,
+        t2p_kwargs: Optional[dict] = None,
         debug: bool = False,
         semantic: bool = False,
         semantic_config: Optional[dict] = None,
         session: Optional[Session] = None,
+        preload_nl: bool = False,
     ) -> None:
-        _require(_AGENT_OK, "pyagentprolog", "pip install pyagentprolog")
-
+        # Без _require: pyagentprolog проверяется лениво в query(),
+        # nl2prolog — в ask()/assert_nl(). Это делает импорт и
+        # Expert() быстрыми (<0.1 с).
         self.graph = graph if graph is not None else KnowledgeGraph()
         self.debug = debug
         self.session = session or NullSession()
@@ -138,29 +222,66 @@ class Expert:
             load_rules(rules_file))
         self._known_rules = discover_rule_predicates(self.rules_src)
 
-        # Кэш человекочитаемых label'ов — по сущности.
-        # Заполняется через attribute(Id, 'label', L) из графа.
-        # Fallback — humanize_vars(Id).replace('_', ' ').
+        # Кэш human_readable: attribute(Id, 'label', L) из графа
         self._label_cache: Dict[str, Optional[str]] = {}
 
-        # NL-парсер и диалог — опциональны
+        # Ленивая инициализация NLP
         self.t2p = t2p
+        self._t2p_kwargs: Dict[str, Any] = dict(t2p_kwargs or {})
         self.dlg = None
-        if _NL2PROLOG_OK:
-            try:
-                self.t2p = self.t2p or TextToProlog()
-                self.dlg = DialogTurn(t2p=self.t2p, agent_factory=Agent)
-            except Exception as e:
-                if self.debug:
-                    print(f"[Expert] nl2prolog init: {e}")
+        self._nl_ready = False
+        self._nl_lock = threading.Lock()
 
         self._last_answer: Optional[ExpertAnswer] = None
+        self._last_missing_inner: Optional[str] = None
         self._semantic_active = False
+
         if semantic:
             self.enable_semantic(semantic_config or {})
 
+        if preload_nl and _ensure_nl2prolog():
+            threading.Thread(
+                target=self._ensure_nl, daemon=True,
+            ).start()
+
     # ------------------------------------------------------------------
-    # Нормализация кавычек в запросе
+    # Ленивая инициализация NLP
+    # ------------------------------------------------------------------
+    def _ensure_nl(self) -> None:
+        """Загрузить TextToProlog и DialogTurn при первом NL-вызове."""
+        if self._nl_ready:
+            return
+        with self._nl_lock:
+            if self._nl_ready:
+                return
+            if not _ensure_nl2prolog():
+                return
+            has_agent = _ensure_agent()
+            try:
+                if self.t2p is None:
+                    self.t2p = _TextToProlog(**self._t2p_kwargs)
+                if has_agent:
+                    self.dlg = _DialogTurn(
+                        t2p=self.t2p, agent_factory=_Agent)
+            except Exception as e:
+                if self.debug:
+                    print(f"[Expert] nl2prolog init: {e}")
+            self._nl_ready = True
+
+    def warmup_nl(self) -> float:
+        """Явно загрузить NLP-модели. Возвращает затраченное время (с).
+
+        Использование в UI:
+            elapsed = e.warmup_nl()
+            print(f"NLP loaded in {elapsed:.2f}s")
+        """
+        import time
+        t0 = time.perf_counter()
+        self._ensure_nl()
+        return time.perf_counter() - t0
+
+    # ------------------------------------------------------------------
+    # Нормализация кавычек
     # ------------------------------------------------------------------
     @staticmethod
     def _normalize_query_atoms(query: str) -> str:
@@ -171,10 +292,9 @@ class Expert:
         валидный атом без кавычек по _VALID_ATOM).
 
         Зачем: `KnowledgeGraph.to_prolog()` пишет валидные атомы без
-        кавычек (`attribute('петров_петр', label, 'Петров Пётр')`),
-        а пользователь может писать `attribute('петров_петр', 'label', L)`.
-        PyAgentProlog сравнивает атомы по строке: `'label'` ≠ `label` —
-        и запрос не находит факт. Нормализация выравнивает обе стороны.
+        кавычек, а пользователь может писать `'label'` в запросе.
+        PyAgentProlog сравнивает атомы по строке: `'label'` ≠ `label`.
+        Нормализация выравнивает обе стороны.
         """
         if not query:
             return query
@@ -187,7 +307,6 @@ class Expert:
                 out.append(ch)
                 i += 1
                 continue
-            # Одиночная кавычка — ищем закрывающую с учётом экранирования
             j = i + 1
             while j < n:
                 if query[j] == "\\" and j + 1 < n:
@@ -197,7 +316,6 @@ class Expert:
                     break
                 j += 1
             if j >= n:
-                # Незакрытая кавычка — оставляем как есть
                 out.append(query[i:])
                 break
             inner = query[i + 1:j]
@@ -206,9 +324,9 @@ class Expert:
                 and _VALID_ATOM_RE.match(inner)
                 and inner not in _RESERVED_ATOMS
             ):
-                out.append(inner)          # снимаем кавычки
+                out.append(inner)
             else:
-                out.append(query[i:j + 1])  # оставляем как есть
+                out.append(query[i:j + 1])
             i = j + 1
         return "".join(out)
 
@@ -223,10 +341,11 @@ class Expert:
         )
 
     def _new_agent(self) -> Any:
-        return Agent(self._program(), context={})
+        _ensure_agent()
+        return _Agent(self._program(), context={})
 
     # ------------------------------------------------------------------
-    # Низкоуровневый Prolog-запрос
+    # Prolog-запрос
     # ------------------------------------------------------------------
     def query(
         self,
@@ -237,20 +356,25 @@ class Expert:
     ) -> QueryResult:
         original = (prolog or "").strip()
         if not original:
-            return QueryResult(ok=False, query="", error="пустой запрос")
+            return QueryResult(
+                ok=False, query="", error="пустой запрос")
 
-        # Нормализация кавычек ДО лифтинга и передачи в Agent:
-        # `attribute('x', 'label', L)` → `attribute('x', label, L)`.
-        # Кириллица остаётся в кавычках.
+        if not _ensure_agent():
+            return QueryResult(
+                ok=False, query=original,
+                error="pyagentprolog не установлен: "
+                      "pip install pyagentprolog",
+            )
+
         original = self._normalize_query_atoms(original)
-
         if not original.endswith("."):
             original += "."
 
         lifted_from: Optional[str] = None
         final = original.rstrip(".")
         if lift and category:
-            lifted = lift_query(final, category, self._known_rules)
+            lifted = lift_query(
+                final, category, self._known_rules)
             if lifted != final:
                 lifted_from = original
                 final = lifted
@@ -293,13 +417,13 @@ class Expert:
                 error=str(e), lifted_from=lifted_from,
             )
 
+        deduped = _dedup_solutions(sols)
         return QueryResult(
             ok=True, query=final_dot,
-            solutions=_dedup_solutions(sols),
-            result=bool(sols),
+            solutions=deduped,
+            result=bool(deduped),
             lifted_from=lifted_from,
         )
-
 
     # ------------------------------------------------------------------
     # NL → ответ
@@ -312,9 +436,12 @@ class Expert:
         category: Optional[str] = None,
         use_dialog: bool = True,
     ) -> ExpertAnswer:
-        _require(_NL2PROLOG_OK, "nl2prolog",
-                 "pip install \"pyagentprolog-expert[nl]\"")
-        assert self.t2p is not None
+        if not _ensure_nl2prolog():
+            raise RuntimeError(
+                "nl2prolog не установлен: "
+                "pip install \"pyagentprolog-expert[nl]\""
+            )
+        self._ensure_nl()
         if not nl or not nl.strip():
             return ExpertAnswer(text="✗ Пустой вопрос.")
 
@@ -326,9 +453,11 @@ class Expert:
                 return ExpertAnswer(text=f"✗ dialog: {e}")
 
             if not isinstance(result, dict):
-                return ExpertAnswer(text="✗ dialog: неожиданный результат")
+                return ExpertAnswer(
+                    text="✗ dialog: неожиданный результат")
             if result.get("error"):
-                return ExpertAnswer(text=f"✗ dialog: {result['error']}")
+                return ExpertAnswer(
+                    text=f"✗ dialog: {result['error']}")
             if result.get("solutions") is not None:
                 return self._answer_from_solutions(result, nl)
 
@@ -337,15 +466,23 @@ class Expert:
                 facts = result.get("facts_extracted", "")
                 ar = self.assert_facts_src(facts)
                 text = (
-                    f"✓ Утверждение принято: +{ar.added.get('nodes', 0)} "
-                    f"узлов, +{ar.added.get('edges', 0)} рёбер, "
+                    f"✓ Утверждение принято: "
+                    f"+{ar.added.get('nodes', 0)} узлов, "
+                    f"+{ar.added.get('edges', 0)} рёбер, "
                     f"+{ar.added.get('attributes', 0)} атрибутов."
                 )
-                return ExpertAnswer(text=text)
+                ans = ExpertAnswer(text=text)
+                self._last_answer = ans
+                return ans
         else:
+            if self.t2p is None:
+                return ExpertAnswer(
+                    text="✗ TextToProlog недоступен")
             try:
                 _, query_src = self.t2p.parse(
-                    nl, strict=True, facts_from_questions=False)
+                    nl, strict=True,
+                    facts_from_questions=False,
+                )
             except Exception as e:
                 return ExpertAnswer(text=f"✗ nl2prolog: {e}")
 
@@ -366,7 +503,7 @@ class Expert:
     def _answer_from_solutions(
         self, result: dict, nl: str,
     ) -> ExpertAnswer:
-        sols = result.get("solutions") or []
+        sols = _dedup_solutions(result.get("solutions") or [])
         q = result.get("query") or ""
         qr = QueryResult(
             ok=True, query=q, solutions=sols,
@@ -378,20 +515,9 @@ class Expert:
         return ans
 
     # ------------------------------------------------------------------
-    # Человекочитаемое представление — через attribute/3 графа
+    # Человекочитаемое представление — attribute(Id, 'label', L)
     # ------------------------------------------------------------------
     def _describe_identifier(self, ident: str) -> str:
-        """Человекочитаемое имя для идентификатора.
-
-        Стратегия (в порядке приоритета):
-          1. attribute(Id, 'label', L) из графа — данные домена,
-             редактируются в kg-editor, приходят из graph.pl.
-          2. humanize_vars(Id) — снять _<N>-суффикс PyAgentProlog.
-          3. Заменить '_' на пробел.
-
-        Никаких human_readable/2-фактов в rules.pl — там только
-        СХЕМА `human_readable(I, L) :- attribute(I, 'label', L).`
-        """
         if not ident:
             return ident
         if ident in self._label_cache:
@@ -400,13 +526,10 @@ class Expert:
                 return cached
             return humanize_vars(ident).replace("_", " ")
 
-        # 1) attribute(Id, 'label', L) — данные графа.
-        # query() сам нормализует `'label'` → `label`, что нужно,
-        # чтобы совпасть с сериализацией graph.to_prolog().
         label: Optional[str] = None
         try:
-            # Экранируем одинарные кавычки в идентификаторе
-            safe = str(ident).replace("\\", "\\\\").replace("'", "\\'")
+            safe = str(ident).replace(
+                "\\", "\\\\").replace("'", "\\'")
             qr = self.query(
                 f"attribute('{safe}', label, X).", lift=False)
             if qr.ok and qr.solutions:
@@ -419,7 +542,6 @@ class Expert:
         self._label_cache[ident] = label
         if label:
             return label
-        # 2) fallback: humanize + подчёркивания → пробелы
         return humanize_vars(ident).replace("_", " ")
 
     def _format_query_result(self, qr: QueryResult) -> str:
@@ -428,13 +550,13 @@ class Expert:
         if qr.result is True and not qr.solutions:
             return "✓ Истина."
         if not qr.solutions:
-            return "Нет решений.\n💡 Уточните вопрос или добавьте факты."
+            return ("Нет решений.\n"
+                    "💡 Уточните вопрос или добавьте факты.")
         lines = []
         for i, sol in enumerate(qr.solutions, 1):
             parts = []
             for k, v in sol.items():
                 if isinstance(v, str):
-                    # человекочитаемое имя через attribute(…,'label',…)
                     v = self._describe_identifier(v)
                 parts.append(f"{k} = {v}")
             lines.append(f"[{i}] " + ", ".join(parts))
@@ -448,17 +570,25 @@ class Expert:
     # NL-утверждение → граф
     # ------------------------------------------------------------------
     def assert_nl(self, nl: str) -> AssertResult:
-        _require(_NL2PROLOG_OK, "nl2prolog",
-                 "pip install \"pyagentprolog-expert[nl]\"")
-        assert self.t2p is not None
+        if not _ensure_nl2prolog():
+            raise RuntimeError(
+                "nl2prolog не установлен: "
+                "pip install \"pyagentprolog-expert[nl]\""
+            )
+        self._ensure_nl()
         if not nl or not nl.strip():
             return AssertResult(
                 ok=False, facts_src="", error="пустой ввод")
+        if self.t2p is None:
+            return AssertResult(
+                ok=False, facts_src="",
+                error="TextToProlog недоступен")
         try:
             facts_src, _ = self.t2p.parse(
                 nl, strict=True, facts_from_questions=True)
         except Exception as e:
-            return AssertResult(ok=False, facts_src="", error=str(e))
+            return AssertResult(
+                ok=False, facts_src="", error=str(e))
         return self.assert_facts_src(facts_src)
 
     def assert_facts_src(self, facts_src: str) -> AssertResult:
@@ -470,7 +600,8 @@ class Expert:
         try:
             other = KnowledgeGraph.from_prolog(facts_src)
         except Exception as e:
-            return AssertResult(ok=False, facts_src=facts_src, error=str(e))
+            return AssertResult(
+                ok=False, facts_src=facts_src, error=str(e))
         stats = self.graph.merge(other)
         return AssertResult(
             ok=True, facts_src=facts_src,
@@ -482,39 +613,91 @@ class Expert:
         )
 
     # ------------------------------------------------------------------
-    # Интерактивный опрос (аналог старого backward-chaining loop)
+    # Интерактивный опрос
     # ------------------------------------------------------------------
-    def ask_interactive(
-        self,
-        nl: str,
-        *,
-        top_k: int = 3,
-        max_turns: int = 10,
-    ) -> str:
+    def ask_interactive(self, nl, *, top_k=3, max_turns=10):
+        if not _ensure_nl2prolog():
+            raise RuntimeError(
+                "nl2prolog не установлен: "
+                "pip install \"pyagentprolog-expert[nl]\"")
+        self._ensure_nl()
+
+        ans = self.ask(nl, top_k=top_k, use_dialog=False)
+        ans_text = ans.text
+        if ans.query_result and ans.query_result.result:
+            return ans_text
         if isinstance(self.session, NullSession):
-            return self.ask(nl, top_k=top_k).text
-        ans_text = ""
+            return ans_text
+
         for _ in range(max_turns):
-            ans = self.ask(nl, top_k=top_k)
-            ans_text = ans.text
-            if ans.query_result and ans.query_result.result:
-                return ans.text
             missing = self._missing_conditions()
             if not missing:
-                return ans.text
-            for cond_nl in missing:
-                reply = self.session.ask_user(cond_nl)
-                if reply is None:
+                if ans.query_result is None:
+                    return (
+                        f"{ans_text}\n\n"
+                        "ℹ️ NL-парсер не распознал фразу как вопрос. "
+                        "Все условия решения уже выполнены. "
+                        "Попробуйте задать прямой вопрос, например: "
+                        "«Кто директор технопарка Тюмень?»."
+                    )
+                return ans_text
+
+            reply = self.session.ask_user(missing[0])
+            if reply is None:
+                return ans_text
+
+            r = self.assert_nl(reply)
+            added_any = (
+                r.added.get("edges", 0)
+                + r.added.get("nodes", 0)
+                + r.added.get("attributes", 0)
+            ) > 0
+
+            if not added_any and self._last_missing_inner:
+                reply_low = reply.strip().lower()
+                if reply_low in ("да", "yes", "верно", "true", "1"):
+                    self._add_triplet_fallback(
+                        self._last_missing_inner)
+                    added_any = True
+
+            if added_any:
+                ans = self.ask(nl, top_k=top_k, use_dialog=False)
+                if ans.query_result and ans.query_result.result:
                     return ans.text
-                self.assert_nl(reply)
+                ans_text = ans.text
+
         return ans_text
 
-    def _missing_conditions(self) -> List[str]:
-        """Собрать невыполненные условия из solution/1-СХЕМЫ в rules.pl.
+    def _add_triplet_fallback(self, inner: str) -> None:
+        """Fallback: добавить triplet/attr/fact в граф.
 
-        Данные solution — узлы node(S, [], solution) и рёбра
+        `inner` может быть в кавычках или без — pyagentprolog через
+        `findall` возвращает строки без кавычек.
+        """
+        inner = inner.strip()
+        m = _TRIPLET_RE.match(inner)
+        if m:
+            pred, s, o = m.groups()
+            self.assert_facts_src(
+                f"edge('{s}', '{o}', '{pred}').\n")
+            return
+        m = _ATTR_RE.match(inner)
+        if m:
+            entity, attr = m.groups()
+            self.assert_facts_src(
+                f"attribute('{entity}', '{attr}', 'true').\n")
+            return
+        m = _FACT_RE.match(inner)
+        if m:
+            self.assert_facts_src(
+                f"node('{m.group(1)}', [], concept).\n")
+
+    def _missing_conditions(self) -> List[str]:
+        """Невыполненные условия из solution/1-СХЕМЫ в rules.pl.
+
+        Данные solution — node(S, [], solution) и рёбра
         edge(S, Target, 'target'), edge(S, Person, 'director')
-        в graph.pl. Здесь — только СХЕМА-обёртка.
+        в graph.pl. Здесь только схема-обёртка.
         """
         if not self.rules_src:
             return []
@@ -526,33 +709,65 @@ class Expert:
         if not isinstance(conds, list):
             return []
         missing: List[str] = []
+        self._last_missing_inner = None
         for c in conds:
-            c_str = str(c)
-            inner = self._strip_condition(c_str)
+            inner = self._strip_condition(str(c))
             if not inner:
                 continue
             check = self.query(f"condition_check({inner}).")
             if not check.result:
+                if self._last_missing_inner is None:
+                    self._last_missing_inner = inner
                 missing.append(self._condition_to_nl(inner))
         return missing
 
     @staticmethod
     def _strip_condition(c: str) -> Optional[str]:
+        """Достать аргумент условия.
+
+        `findall(C, condition(C), Cs)` возвращает уже РАЗВЁРНУТЫЙ аргумент
+        (`triplet(...)`, `attr(...)`, `fact(...)`), а не `condition(...)`.
+        Поэтому обрабатываем оба варианта.
+        """
+        c = c.strip()
         for prefix in ("condition(", "not_condition("):
             if c.startswith(prefix) and c.endswith(")"):
-                return c[len(prefix):-1]
+                return c[len(prefix):-1].strip()
+        # Уже развёрнуто findall'ом
+        if c.startswith(("triplet(", "attr(", "fact(")) and c.endswith(")"):
+            return c
         return None
 
     def _condition_to_nl(self, inner: str) -> str:
-        """Очень простой NL-шаблон для доопроса. Домен-нейтральный."""
-        return f"Верно ли, что {inner.replace('_', ' ')}?"
+        """NL-шаблон для доопроса. Домен-нейтральный."""
+        inner = inner.strip()
+        m = _TRIPLET_RE.match(inner)
+        if m:
+            pred, s, o = m.groups()
+            return (
+                f"Верно ли, что «{self._describe_identifier(s)}» "
+                f"— {pred} «{self._describe_identifier(o)}»?"
+            )
+        m = _ATTR_RE.match(inner)
+        if m:
+            entity, attr = m.groups()
+            return (
+                f"Верно ли, что у "
+                f"«{self._describe_identifier(entity)}» "
+                f"есть «{attr}»?"
+            )
+        m = _FACT_RE.match(inner)
+        if m:
+            return f"Верно ли, что «{m.group(1)}»?"
+        return f"Верно ли, что {inner}?"
 
     # ------------------------------------------------------------------
     # why()
     # ------------------------------------------------------------------
     def why(self) -> str:
         if self._last_answer is None:
-            return "Пока нет ни одного ответа. Задайте вопрос эксперту."
+            return ("Пока нет ни одного ответа. "
+                    "Задайте вопрос эксперту.")
         ans = self._last_answer
         qr = ans.query_result
         lines: List[str] = []
@@ -561,7 +776,8 @@ class Expert:
             if qr.lifted_from:
                 lines.append(f"Исходный (L1): {qr.lifted_from}")
                 lines.append(
-                    f"Применён query-lifting → {qr.query.strip()}")
+                    f"Применён query-lifting → "
+                    f"{qr.query.strip()}")
             if qr.error:
                 lines.append(f"Ошибка: {qr.error}")
             elif qr.result is True:
@@ -583,13 +799,16 @@ class Expert:
         lines.append("Источники истины:")
         lines.append(f"  • граф: {self.graph.summary()}")
         lines.append(
-            f"  • rules.pl: {'загружен' if self.rules_src else 'пуст'}")
+            f"  • rules.pl: "
+            f"{'загружен' if self.rules_src else 'пуст'}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # Semantic (совместимость со старым Expert)
+    # Semantic
     # ------------------------------------------------------------------
-    def enable_semantic(self, config: Optional[dict] = None) -> bool:
+    def enable_semantic(
+        self, config: Optional[dict] = None,
+    ) -> bool:
         try:
             import prolog.embedding_unify as eu
         except ImportError:
@@ -644,6 +863,7 @@ class Expert:
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self._last_answer = None
+        self._last_missing_inner = None
         self._label_cache.clear()
         if self.dlg is not None:
             with contextlib.suppress(Exception):

@@ -73,5 +73,5 @@ solution(S) :- node(S, _, solution).
 
 condition(triplet('директор', P, Org)) :-
     edge(S, Org, 'target'),
-    edge(S, P, 'director'),
+    edge(S, P, 'директор'),
     solution(S).

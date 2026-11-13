@@ -1,75 +1,111 @@
-"""interactive.py — интерактивный опрос через ask_interactive().
-
-Пользователь вводит «Хочу назначить директора в Тюмень» — Expert
-задаёт вопросы, пользователь отвечает, факты добавляются в граф.
-"""
+"""interactive.py — интерактивный диалог с Expert."""
 from __future__ import annotations
 
-import queue
-import threading
+import time
+from typing import Optional
 
 from pyagentprolog_expert import Expert, KnowledgeGraph, Session
 
 
 class ConsoleSession(Session):
-    """Session с консольным вводом/выводом в отдельном потоке."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def _loop(self) -> None:
-        while True:
-            try:
-                msgs = self.poll()
-            except Exception:
-                return
-            for kind, payload in msgs:
-                if kind == "question":
-                    print(f"\n[Expert] {payload}")
-                    try:
-                        answer = input("> ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        self.send("")
-                        return
-                    self.send(answer)
-            if self._stopped():
-                return
-
-    def _stopped(self) -> bool:
+    def ask_user(self, question: str) -> Optional[str]:
+        print(f"\n[Expert] {question}")
         try:
-            return self.input_queue.get_nowait() is None
-        except queue.Empty:
-            return False
+            return input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
 
 
 def main() -> None:
-    g = KnowledgeGraph.from_prolog(open("graph.pl", encoding="utf-8").read())
-    sess = ConsoleSession()
-    e = Expert(graph=g, rules_file="rules.pl", session=sess)
+    t_start = time.perf_counter()
+
+    with open("graph.pl", encoding="utf-8") as f:
+        g = KnowledgeGraph.from_prolog(f.read())
+    print(f"[{time.perf_counter()-t_start:.2f}s] graph: "
+          f"nodes={len(g.nodes)} edges={len(g.edges)} "
+          f"attrs={len(g.attributes)}")
+
+    t0 = time.perf_counter()
+    e = Expert(
+        graph=g, rules_file="rules.pl",
+        t2p_kwargs={"use_spacy": False},
+        session=ConsoleSession(),
+    )
+    print(f"[{time.perf_counter()-t0:.2f}s] Expert created")
+
+    print("Loading NLP models (10-20s on first run)...", flush=True)
+    print(f"[{e.warmup_nl():.2f}s] NLP loaded")
+    print(f"[{time.perf_counter()-t_start:.2f}s] total startup")
 
     print("=" * 70)
-    print("Интерактивный режим: «Хочу назначить директора в Тюмень»")
+    print("Interactive mode. Type 'exit' to quit.")
+    print("  • Вопрос:      «Кто директор технопарка Тюмень?»")
+    print("  • Утверждение: «Смирнова Анна — директор технопарка Тюмень»")
+    print("  • Императив:   «Хочу назначить директора в Тюмень»")
     print("=" * 70)
 
-    try:
-        result = e.ask_interactive(
-            "Хочу назначить директора в технопарк Тюмень",
-            top_k=3,
-            max_turns=5,
-        )
-        print()
-        print("=" * 70)
-        print("Результат:")
-        print(result)
-        print()
-        print("Граф после диалога:", e.graph.summary())
-        print()
-        print("why():")
-        print(e.why())
-    finally:
-        sess.stop()
+    while True:
+        try:
+            text = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not text:
+            continue
+        if text in ("exit", "quit", "выход"):
+            return
+
+        t0 = time.perf_counter()
+        try:
+            ans = e.ask(text, use_dialog=False)
+        except RuntimeError as exc:
+            print(f"✗ {exc}")
+            continue
+        elapsed = time.perf_counter() - t0
+
+        if ans.query_result is None:
+            # NL не распознан → ask_interactive (цикл доопроса)
+            print(f"[{elapsed:.2f}s] NL-парсер не распознал — "
+                  f"пробую ask_interactive()")
+            try:
+                result = e.ask_interactive(
+                    text, top_k=3, max_turns=5)
+            except RuntimeError as exc:
+                print(f"✗ {exc}")
+                continue
+            print()
+            print(result)
+            print()
+            print(f"graph: {e.graph.summary()}")
+            if e._last_answer and e._last_answer.query_result:
+                print()
+                print("--- why() ---")
+                print(e.why())
+            continue
+
+        print(f"[{elapsed:.2f}s]")
+        print(ans.text)
+
+        if ans.query_result.result:
+            print()
+            print("--- why() ---")
+            print(e.why())
+            continue
+
+        try:
+            fact_text = input(
+                "[добавить факт, Enter — пропустить] > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if fact_text:
+            t0 = time.perf_counter()
+            r = e.assert_nl(fact_text)
+            print(f"[{time.perf_counter()-t0:.2f}s] "
+                  f"added={r.added}")
+            if r.added.get("edges", 0) or r.added.get("nodes", 0):
+                print(f"  graph: {e.graph.summary()}")
 
 
 if __name__ == "__main__":
